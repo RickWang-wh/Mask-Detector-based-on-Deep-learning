@@ -61,9 +61,9 @@ class MaskDataSet(Dataset):
 
 def train_test_dataload():
 
-    list_Train_Mask,list_Test_Mask = train_test_split(list_Data_Mask,train_size=0.05,test_size=0.05)
+    list_Train_Mask,list_Test_Mask = train_test_split(list_Data_Mask,train_size=0.025,test_size=0.005)
 
-    list_Train_Nomask,list_Test_Nomask = train_test_split(list_Data_Nomask,train_size=0.05,test_size=0.05)
+    list_Train_Nomask,list_Test_Nomask = train_test_split(list_Data_Nomask,train_size=0.025,test_size=0.005)
 
     list_Train = list_Train_Mask + list_Train_Nomask
     list_Test = list_Test_Mask + list_Test_Nomask
@@ -79,57 +79,86 @@ def train_test_dataload():
     df_Test.to_csv('test.csv')
 
 #重写DataSet类，特别是其中的__len__和__getitem__方法
-
+    
     dataset_Train = MaskDataSet('train.csv',)
     dataset_Test = MaskDataSet('test.csv')
-    return DataLoader(dataset_Train,3,shuffle=True),DataLoader(dataset_Test,3,shuffle=True)   #此处确定一个超参数batch_size ,由于本机GPU内存太小，只能接受3个图像
+    return DataLoader(dataset_Train,1,shuffle=True,drop_last=True),DataLoader(dataset_Test,1,shuffle=True,drop_last=True)   
+    #此处确定一个超参数batch_size ,由于本机GPU内存太小，只能接受3个图像
 
 
 
 '''---Build the CNN Model'''
+def conv_block(in_channel, out_channel, kernel_size=3, strid=1, groups=1):
+    padding = 0 if kernel_size == 1 else 1
+    return nn.Sequential(
+        nn.Conv2d(in_channel,out_channel,kernel_size,strid,padding=padding,groups=groups,bias=False),
+        nn.BatchNorm2d(out_channel),
+        nn.ReLU6(inplace=True)
+    )
+
+class InvertedResidual(nn.Module):  # 定义倒置残差结构,Inverted Residual
+    def __init__(self, in_channel, out_channel, strid, t=6):  # 初始化方法
+        super(InvertedResidual, self).__init__()  # 继承初始化方法
+        self.in_channel = in_channel  # 输入通道数
+        self.out_channel = out_channel  # 输出通道数
+        self.strid = strid  # 步长
+        self.t = t  # 中间层通道扩大倍数，对应原文expansion ratio
+        self.hidden_channel = in_channel * t  # 计算中间层通道数
+ 
+        layers = []  # 存放模型结构
+        if self.t != 1:  # 如果expansion ratio不为1
+            layers += [conv_block(self.in_channel, self.hidden_channel, kernel_size=1)]  # 添加conv+bn+relu6
+        layers += [conv_block(self.hidden_channel, self.hidden_channel, strid=self.strid, groups=self.hidden_channel),
+                   # 添加conv+bn+relu6，此处使用组数等于输入通道数的分组卷积实现depthwise conv
+                   conv_block(self.hidden_channel, self.out_channel, kernel_size=1)[
+                   :-1]]  # 添加1x1conv+bn，此处不再进行relu6
+        self.residul_block = nn.Sequential(*layers)  # 倒置残差结构块
+ 
+    def forward(self, x):  # 前传函数
+        if self.strid == 1 and self.in_channel == self.out_channel:  # 如果卷积步长为1且前后通道数一致，则连接残差边
+            return x + self.residul_block(x)  # x+F(x)
+        else:  # 否则不进行残差连接
+            return self.residul_block(x)  # F(x)
+ 
+
+
 class MASKmodel(nn.Module):
-    def __init__(self):
+    def __init__(self,num_classes):
         super(MASKmodel,self).__init__()
 
-        self.flatten = nn.Flatten(start_dim=1)
-
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels=3,out_channels = 32,kernel_size = 3,stride = 1),  #这里输入的图像数据要是（C,H,W）
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(4,4),
-
-            nn.Conv2d(in_channels=32,out_channels = 64,kernel_size = 3,stride = 1),  #这里输入的图像数据要是（C,H,W）
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(4,4),
-
-            nn.Conv2d(in_channels=64,out_channels = 128,kernel_size = 3,stride = 1),  #这里输入的图像数据要是（C,H,W）
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(4,4),
-
-            nn.Conv2d(in_channels=128,out_channels = 256,kernel_size = 3,stride = 1),  #这里输入的图像数据要是（C,H,W）
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(4,4)
+        self.num_classes = num_classes  # 类别数量
+        self.feature = nn.Sequential(  # 特征提取部分
+            conv_block(3, 32, strid=2),  # conv+bn+relu6,(n,3,224,224)-->(n,32,112,112)
+            InvertedResidual(32, 16, strid=1, t=1),  # inverted residual block,(n,32,112,112)-->(n,16,112,112)
+            InvertedResidual(16, 24, strid=2),  # inverted residual block,(n,16,112,112)-->(n,24,56,56)
+            InvertedResidual(24, 24, strid=1),  # inverted residual block,(n,24,56,56)-->(n,24,56,56)
+            InvertedResidual(24, 32, strid=2),  # inverted residual block,(n,24,56,56)-->(n,32,28,28)
+            InvertedResidual(32, 32, strid=1),  # inverted residual block,(n,32,28,28)-->(n,32,28,28)
+            InvertedResidual(32, 32, strid=1),  # inverted residual block,(n,32,28,28)-->(n,32,28,28)
+            InvertedResidual(32, 64, strid=2),  # inverted residual block,(n,32,28,28)-->(n,64,14,14)
+            InvertedResidual(64, 64, strid=1),  # inverted residual block,(n,64,14,14)-->(n,64,14,14)
+            InvertedResidual(64, 64, strid=1),  # inverted residual block,(n,64,14,14)-->(n,64,14,14)
+            InvertedResidual(64, 64, strid=1),  # inverted residual block,(n,64,14,14)-->(n,64,14,14)
+            InvertedResidual(64, 96, strid=1),  # inverted residual block,(n,64,14,14)-->(n,96,14,14)
+            InvertedResidual(96, 96, strid=1),  # inverted residual block,(n,96,14,14)-->(n,96,14,14)
+            InvertedResidual(96, 96, strid=1),  # inverted residual block,(n,96,14,14)-->(n,96,14,14)
+            InvertedResidual(96, 160, strid=2),  # inverted residual block,(n,96,14,14)-->(n,160,7,7)
+            InvertedResidual(160, 160, strid=1),  # inverted residual block,(n,160,7,7)-->(n,160,7,7)
+            InvertedResidual(160, 160, strid=1),  # inverted residual block,(n,160,7,7)-->(n,160,7,7)
+            InvertedResidual(160, 320, strid=1),  # inverted residual block,(n,160,7,7)-->(n,320,7,7)
+            conv_block(320, 1280, kernel_size=1)  # conv+bn+relu6,(n,320,7,7)-->(n,1280,7,7)
         )
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(p=0.5),
-            nn.Linear(256 * 3 * 3, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(256,5),
-            nn.Softmax(dim=1)
-
+ 
+        self.classifier = nn.Sequential(  # 分类部分
+            nn.AdaptiveAvgPool2d(1),  # avgpool,(n,1280,7,7)-->(n,1280,1,1)
+            nn.Conv2d(1280, self.num_classes, 1, 1, 0)  # 1x1conv,(n,1280,1,1)-->(n,num_classes,1,1),等同于linear
         )
+ 
+    def forward(self, x):  # 前传函数
+        x = self.feature(x)  # 提取特征
+        x = self.classifier(x)  # 分类
+        return x.view(-1, self.num_classes)
 
-    def forward(self,x):
-        #x = self.flatten(x)
-        ###卷积
-        x = self.features(x)
-        ###全连接
-        x = self.flatten(x)
-        x = self.classifier(x)
-        return  x             #size:
 
 
 def train_loop(dataloader, model, loss_fn, optimizer):
@@ -173,10 +202,10 @@ def test_loop(dataloader, model, loss_fn):
 
 
 device = torch.device("cuda:0")
-model = MASKmodel()
+model = MASKmodel(num_classes=5)
 model.to(device)
 cost = nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(model.parameters(),lr=0.001,momentum=0.9)#,weight_decay=0.8,nesterov=True)
+optimizer = torch.optim.SGD(model.parameters(),lr=0.002,momentum=0.8)#,weight_decay=0.8,nesterov=True)  
 #print(model)
 
 
@@ -187,47 +216,5 @@ for t in range(epochs):
     print(f"Epoch {t+1}\n-------------------------------")
     train_loop(dataload_Data_train, model, cost, optimizer)
     test_loop(dataload_Data_test, model, cost)
+# Save the model as a file
 print("Done!")
-
-
-'''
-n_epochs = 5
-#with torch.no_grad():
-for epoch in range(n_epochs):
-    dataload_Data_train,dataload_Data_test = train_test_dataload()
-    running_loss = 0.0
-    running_correct = 0
-    print("Epoch {}/{}".format(epoch+1,n_epochs))
-    print("-"*10)
-    for batchs,(X,y) in enumerate(dataload_Data_train):
-        X = X.to(device)
-        y = y.to(device)
-        outputs = model(X)
-        _,pred=torch.max(outputs.data,1)
-        optimizer.zero_grad()
-        loss = cost(outputs,y)           
-        
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.data
-        running_correct += torch.sum(pred == y)
-
-
-    testing_correct = 0   
-
-    for batchs,(X,y) in enumerate(dataload_Data_test):
-        X = X.to(device)
-        y = y.to(device)   
-        outputs = model(X)
-        _,pred=torch.max(outputs.data,1)
-        testing_correct += torch.sum(pred == y)
-
-    print("Loss is:{:.4f},Train Accuracy is:{:.4f}%,{}/{},Test Accuracy is:{:.4f}%,{}/{}"\
-          .format(running_loss/len(dataload_Data_train)\
-          ,100*running_correct/len(dataload_Data_train)/3\
-          ,running_correct\
-          ,3*len(dataload_Data_train)\
-          ,100*testing_correct/len(dataload_Data_test)/3\
-          ,testing_correct\
-          ,3*len(dataload_Data_test)))
-'''
